@@ -18,6 +18,8 @@ import (
 
 const DefaultPanelGitHubRepository = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
 
+var modelFallbackLookup map[string]string
+
 // Config represents the application's configuration, loaded from a YAML file.
 type Config struct {
 	SDKConfig `yaml:",inline"`
@@ -101,6 +103,15 @@ type Config struct {
 
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
+
+	// ModelFallbacks defines automatic fallback chains between models.
+	// When a model fails due to quota exhaustion (HTTP 429), the request automatically
+	// falls back to the next model in the chain. Example: gemini-2.5-pro → gemini-2.5-flash → claude-sonnet-4
+	ModelFallbacks []ModelFallback `yaml:"model-fallbacks,omitempty" json:"model-fallbacks"`
+
+	// ModelFallbackDepth limits the maximum fallback chain length to prevent infinite loops.
+	// Defaults to 3 if not set. Set to 0 to disable fallback chaining.
+	ModelFallbackDepth *int `yaml:"model-fallback-depth,omitempty" json:"model-fallback-depth"`
 
 	legacyMigrationPending bool `yaml:"-" json:"-"`
 }
@@ -234,6 +245,16 @@ type PayloadModelRule struct {
 	Name string `yaml:"name" json:"name"`
 	// Protocol restricts the rule to a specific translator format (e.g., "gemini", "responses").
 	Protocol string `yaml:"protocol" json:"protocol"`
+}
+
+// ModelFallback defines a fallback relationship between models in a chain.
+// When a model fails due to quota exhaustion, the request automatically falls back
+// to the next model in the chain. Chains can be arbitrarily long (A→B→C→D).
+type ModelFallback struct {
+	// From is the primary model or intermediate fallback model.
+	From string `yaml:"from" json:"from"`
+	// To is the next model in the fallback chain.
+	To string `yaml:"to" json:"to"`
 }
 
 // ClaudeKey represents the configuration for a Claude API key,
@@ -482,6 +503,12 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sync request authentication providers with inline API keys for backwards compatibility.
 	syncInlineAccessProvider(&cfg)
 
+	// Default model fallback chain depth
+	if cfg.ModelFallbackDepth == nil {
+		cfg.ModelFallbackDepth = new(int)
+		*cfg.ModelFallbackDepth = 3
+	}
+
 	// Sanitize Gemini API key configuration and migrate legacy entries.
 	cfg.SanitizeGeminiKeys()
 
@@ -502,6 +529,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Normalize global OAuth model name mappings.
 	cfg.SanitizeOAuthModelMappings()
+
+	// Sanitize model fallback configuration
+	cfg.SanitizeModelFallbacks()
 
 	if cfg.legacyMigrationPending {
 		fmt.Println("Detected legacy configuration keys, attempting to persist the normalized config...")
@@ -561,6 +591,79 @@ func (cfg *Config) SanitizeOAuthModelMappings() {
 		}
 	}
 	cfg.OAuthModelMappings = out
+}
+
+// SanitizeModelFallbacks validates and normalizes model fallback chains.
+// It removes empty entries, detects circular references, deduplicates, and normalizes model names.
+func (cfg *Config) SanitizeModelFallbacks() {
+	if cfg == nil {
+		return
+	}
+	if cfg.ModelFallbackDepth != nil && *cfg.ModelFallbackDepth < 0 {
+		*cfg.ModelFallbackDepth = 3
+	}
+	if len(cfg.ModelFallbacks) == 0 {
+		return
+	}
+
+	// Build a map to detect cycles and duplicates
+	// Key is lowercase From model
+	fallbacks := make(map[string]string)   // from -> to (lowercase keys)
+	seenPairs := make(map[string]struct{}) // from|to -> struct{}
+	out := make([]ModelFallback, 0, len(cfg.ModelFallbacks))
+
+	for _, fb := range cfg.ModelFallbacks {
+		from := strings.TrimSpace(fb.From)
+		to := strings.TrimSpace(fb.To)
+		if from == "" || to == "" {
+			continue
+		}
+		if strings.EqualFold(from, to) {
+			continue
+		}
+		fromLower := strings.ToLower(from)
+		toLower := strings.ToLower(to)
+		pairKey := fromLower + "|" + toLower
+
+		if _, ok := seenPairs[pairKey]; ok {
+			continue
+		}
+		seenPairs[pairKey] = struct{}{}
+
+		// Check if adding this would create a cycle
+		// If there's a path from to -> from (transitively), this would create a cycle
+		if cfg.hasFallbackCycle(fromLower, toLower, fallbacks) {
+			continue
+		}
+
+		fallbacks[fromLower] = toLower
+		out = append(out, ModelFallback{From: from, To: to})
+	}
+
+	// Store the cleaned fallback map for runtime use
+	modelFallbackLookup = fallbacks
+	cfg.ModelFallbacks = out
+}
+
+// hasFallbackCycle checks if adding from→to would create a cycle
+func (cfg *Config) hasFallbackCycle(from, to string, fallbacks map[string]string) bool {
+	// Check if to already leads back to from (directly or transitively)
+	current := to
+	visited := make(map[string]bool)
+	for {
+		if visited[current] {
+			return true // Cycle detected
+		}
+		visited[current] = true
+		next, ok := fallbacks[current]
+		if !ok {
+			return false // No path from to to anywhere
+		}
+		if strings.EqualFold(next, from) {
+			return true // Direct or indirect cycle back to from
+		}
+		current = next
+	}
 }
 
 // SanitizeOpenAICompatibility removes OpenAI-compatibility provider entries that are

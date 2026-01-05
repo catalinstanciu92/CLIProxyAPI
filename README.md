@@ -64,6 +64,12 @@ CLIProxyAPI Guides: [https://help.router-for.me/](https://help.router-for.me/)
 
 see [MANAGEMENT_API.md](https://help.router-for.me/management/api)
 
+## Auto Model Fallback
+
+CLIProxyAPI supports automatic model fallback when the primary model fails due to quota exhaustion (HTTP 429). This ensures high availability for your applications.
+
+For configuration details, see [docs/model-fallback.md](docs/model-fallback.md).
+
 ## Amp CLI Support
 
 CLIProxyAPI includes integrated support for [Amp CLI](https://ampcode.com) and Amp IDE extensions, enabling you to use your Google/ChatGPT/Claude OAuth subscriptions with Amp's coding tools:
