@@ -60,9 +60,17 @@ Get 10% OFF GLM CODING PLAN：https://z.ai/subscribe?ic=8JVLJQFSKB
 
 CLIProxyAPI Guides: [https://help.router-for.me/](https://help.router-for.me/)
 
+For development environment setup and instructions on running the project locally or via Docker, please refer to [RUN.md](RUN.md).
+
 ## Management API
 
 see [MANAGEMENT_API.md](https://help.router-for.me/management/api)
+
+## Auto Model Fallback
+
+CLIProxyAPI supports automatic model fallback when the primary model fails due to quota exhaustion (HTTP 429). This ensures high availability for your applications.
+
+For configuration details, see [docs/model-fallback.md](docs/model-fallback.md).
 
 ## Amp CLI Support
 

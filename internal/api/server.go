@@ -251,6 +251,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	s.applyAccessConfig(nil, cfg)
 	if authManager != nil {
 		authManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second)
+		authManager.SetFallbackConfig(cfg)
 	}
 	managementasset.SetCurrentConfig(cfg)
 	auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
@@ -310,6 +311,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 // It defines the endpoints and associates them with their respective handlers.
 func (s *Server) setupRoutes() {
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
+	s.engine.GET("/management_fallbacks.html", s.serveManagementFallbacks)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	geminiCLIHandlers := gemini.NewGeminiCLIAPIHandler(s.handlers)
@@ -622,6 +624,12 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/iflow-auth-url", s.mgmt.RequestIFlowCookieToken)
 		mgmt.POST("/oauth-callback", s.mgmt.PostOAuthCallback)
 		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
+
+		mgmt.GET("/model-fallbacks", s.mgmt.GetModelFallbacks)
+		mgmt.PUT("/model-fallbacks", s.mgmt.PutModelFallbacks)
+		mgmt.POST("/model-fallbacks", s.mgmt.PostModelFallbacks)
+		mgmt.DELETE("/model-fallbacks", s.mgmt.DeleteModelFallbacks)
+		mgmt.GET("/available-models", s.mgmt.GetAvailableModels)
 	}
 }
 
@@ -655,6 +663,116 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		}
 
 		log.WithError(err).Error("failed to stat management control panel asset")
+		c.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+
+	// Read and inject Model Fallbacks menu item into the management control panel
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		log.WithError(err).Error("failed to read management control panel asset")
+		c.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+
+	// Inject a script that adds the Model Fallbacks menu item to the sidebar
+	injectedScript := `<script>
+(function() {
+	function addFallbacksMenuItem() {
+		// Find sidebar navigation - try common React sidebar patterns
+		var navItems = document.querySelectorAll('nav a, [class*="sidebar"] a, [class*="menu"] a, [class*="nav"] a');
+		var quotaItem = null;
+		var usageItem = null;
+
+		for (var i = 0; i < navItems.length; i++) {
+			var text = navItems[i].textContent || '';
+			if (text.indexOf('Quota') !== -1) quotaItem = navItems[i];
+			if (text.indexOf('Usage') !== -1) usageItem = navItems[i];
+		}
+
+		// Check if already added
+		for (var i = 0; i < navItems.length; i++) {
+			if ((navItems[i].textContent || '').indexOf('Model Fallbacks') !== -1) return true;
+		}
+
+		var referenceItem = quotaItem || usageItem;
+		if (!referenceItem) return false;
+
+		// Clone and modify
+		var newItem = referenceItem.cloneNode(true);
+		newItem.href = '/management_fallbacks.html';
+
+		// Update text content
+		var textNodes = newItem.querySelectorAll('span, div, p');
+		for (var i = 0; i < textNodes.length; i++) {
+			var txt = textNodes[i].textContent || '';
+			if (txt.indexOf('Quota') !== -1 || txt.indexOf('Usage') !== -1) {
+				textNodes[i].textContent = 'Model Fallbacks';
+				break;
+			}
+		}
+		if (!textNodes.length) newItem.textContent = 'Model Fallbacks';
+
+		// Try to update the icon if it uses SVG
+		var svg = newItem.querySelector('svg');
+		if (svg) {
+			svg.innerHTML = '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"/>';
+		}
+
+		// Insert after reference item
+		if (referenceItem.parentNode) {
+			referenceItem.parentNode.insertBefore(newItem, referenceItem.nextSibling);
+		}
+		return true;
+	}
+
+	// Try immediately and with delays for React hydration
+	if (!addFallbacksMenuItem()) {
+		setTimeout(addFallbacksMenuItem, 500);
+		setTimeout(addFallbacksMenuItem, 1500);
+		setTimeout(addFallbacksMenuItem, 3000);
+	}
+
+	// Also observe DOM changes for SPA navigation
+	var observer = new MutationObserver(function() { addFallbacksMenuItem(); });
+	observer.observe(document.body, { childList: true, subtree: true });
+})();
+</script>`
+
+	// Inject before </body> or </html>
+	htmlContent := string(content)
+	if idx := strings.LastIndex(htmlContent, "</body>"); idx != -1 {
+		htmlContent = htmlContent[:idx] + injectedScript + htmlContent[idx:]
+	} else if idx := strings.LastIndex(htmlContent, "</html>"); idx != -1 {
+		htmlContent = htmlContent[:idx] + injectedScript + htmlContent[idx:]
+	} else {
+		htmlContent += injectedScript
+	}
+
+	c.Header("Content-Type", "text/html; charset=utf-8")
+	c.String(http.StatusOK, htmlContent)
+}
+
+func (s *Server) serveManagementFallbacks(c *gin.Context) {
+	cfg := s.cfg
+	if cfg == nil {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+
+	staticDir := managementasset.StaticDir(s.configFilePath)
+	if staticDir == "" {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+	filePath := filepath.Join(staticDir, "management_fallbacks.html")
+
+	if _, err := os.Stat(filePath); err != nil {
+		if os.IsNotExist(err) {
+			c.AbortWithStatus(http.StatusNotFound)
+			return
+		}
+		log.WithError(err).Error("failed to stat management fallback UI asset")
 		c.AbortWithStatus(http.StatusInternalServerError)
 		return
 	}

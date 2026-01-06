@@ -251,6 +251,32 @@ ws-auth: false
 #   iflow:
 #     - "tstars2.0"
 
+# Auto Model Fallback Chain
+# When a model fails due to quota exhaustion (HTTP 429), automatically fallback to the next model in the chain.
+# Fallback only triggers on 429 errors - other errors (404, 401, 500, etc.) stop the chain.
+# Chains can be arbitrarily long. Configure as: A -> B -> C means A fails quota -> B fails quota -> C.
+# The original model is tracked in usage statistics with "(fallback from: MODEL)" suffix.
+# model-fallbacks:
+#   - from: "gemini-2.5-pro"       # Primary model that will fallback
+#     to: "gemini-2.5-flash"       # Fallback when gemini-2.5-pro quota is exhausted
+#   - from: "gemini-2.5-flash"     # If gemini-2.5-flash also fails quota
+#     to: "claude-sonnet-4"         # Fall back to Claude
+#   - from: "claude-sonnet-4"
+#     to: "claude-haiku-3-5"
+#
+# Example configuration:
+# model-fallbacks:
+#   - from: gemini-claude-opus-4-5-thinking
+#     to: gemini-3-pro-preview
+#   - from: gemini-3-pro-preview
+#     to: gemini-3-flash-preview
+#   - from: gemini-3-flash-preview
+#     to: gemini-claude-sonnet-4-5-thinking
+# model-fallback-depth: 3
+#
+# Maximum fallback chain depth (default: 3). Set to 0 to disable fallback chaining.
+# model-fallback-depth: 3
+
 # Optional payload configuration
 # payload:
 #   default: # Default rules only set parameters when they are missing in the payload.

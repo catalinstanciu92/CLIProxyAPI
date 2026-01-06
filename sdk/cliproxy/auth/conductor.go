@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -69,6 +70,15 @@ type Result struct {
 	Error *Error
 }
 
+// FallbackMetadata carries information about model fallback chains.
+// This is stored in request Metadata for tracking and response translation.
+type FallbackMetadata struct {
+	// OriginalModel is the first model that triggered the fallback chain.
+	OriginalModel string `json:"original_model"`
+	// FallbackHistory records the sequence of fallbacks: [fallback1, fallback2, ...]
+	FallbackHistory []string `json:"fallback_history"`
+}
+
 // Selector chooses an auth candidate for execution.
 type Selector interface {
 	Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error)
@@ -107,12 +117,15 @@ type Manager struct {
 	// providerOffsets tracks per-model provider rotation state for multi-provider routing.
 	providerOffsets map[string]int
 
-	// Retry controls request retry behavior.
+	// Retry control request retry behavior.
 	requestRetry     atomic.Int32
 	maxRetryInterval atomic.Int64
 
 	// modelNameMappings stores global model name alias mappings (alias -> upstream name) keyed by channel.
 	modelNameMappings atomic.Value
+
+	// fallbackConfig stores model fallback chains
+	fallbackConfig atomic.Value
 
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProvider RoundTripperProvider
@@ -178,6 +191,70 @@ func (m *Manager) SetRetryConfig(retry int, maxRetryInterval time.Duration) {
 	}
 	m.requestRetry.Store(int32(retry))
 	m.maxRetryInterval.Store(maxRetryInterval.Nanoseconds())
+}
+
+// SetFallbackConfig stores the configuration for model fallback chains.
+func (m *Manager) SetFallbackConfig(cfg *config.Config) {
+	if m == nil || cfg == nil {
+		return
+	}
+	m.fallbackConfig.Store(cfg)
+}
+
+// getModelFallbackDepth returns the configured max fallback depth.
+func (m *Manager) getModelFallbackDepth() int {
+	if m == nil {
+		return 3
+	}
+	v := m.fallbackConfig.Load()
+	if v == nil {
+		return 3
+	}
+	cfg, ok := v.(*config.Config)
+	if !ok || cfg == nil {
+		return 3
+	}
+	if cfg.ModelFallbackDepth == nil || *cfg.ModelFallbackDepth <= 0 {
+		return 0
+	}
+	return *cfg.ModelFallbackDepth
+}
+
+// GetFallbackForModel returns the fallback model for a given model, or empty string if none.
+func (m *Manager) GetFallbackForModel(model string) string {
+	if m == nil || model == "" {
+		return ""
+	}
+	v := m.fallbackConfig.Load()
+	if v == nil {
+		return ""
+	}
+	cfg, ok := v.(*config.Config)
+	if !ok || cfg == nil || len(cfg.ModelFallbacks) == 0 {
+		return ""
+	}
+	for _, fb := range cfg.ModelFallbacks {
+		if strings.EqualFold(fb.From, model) {
+			return fb.To
+		}
+	}
+	return ""
+}
+
+// ShouldChainFallback determines if the error warrants chaining to the next fallback.
+// Only HTTP 429 (quota exceeded) triggers automatic chaining.
+func (m *Manager) ShouldChainFallback(err error) bool {
+	if err == nil {
+		return false
+	}
+	var statusErr cliproxyexecutor.StatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.StatusCode() == http.StatusTooManyRequests
+	}
+	if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "quota") {
+		return true
+	}
+	return false
 }
 
 // RegisterExecutor registers a provider executor with the manager.
@@ -260,36 +337,88 @@ func (m *Manager) Load(ctx context.Context) error {
 
 // Execute performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
+// When a model fails due to quota exhaustion (HTTP 429), it automatically falls back
+// to the next model in the configured fallback chain.
 func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	normalized := m.normalizeProviders(providers)
-	if len(normalized) == 0 {
-		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
-	}
-	rotated := m.rotateProviders(req.Model, normalized)
-
-	retryTimes, maxWait := m.retrySettings()
-	attempts := retryTimes + 1
-	if attempts < 1 {
-		attempts = 1
-	}
+	originalModel := req.Model
+	fallbackHistory := []string{}
+	maxDepth := m.getModelFallbackDepth()
 
 	var lastErr error
-	for attempt := 0; attempt < attempts; attempt++ {
-		resp, errExec := m.executeProvidersOnce(ctx, rotated, func(execCtx context.Context, provider string) (cliproxyexecutor.Response, error) {
-			return m.executeWithProvider(execCtx, provider, req, opts)
-		})
-		if errExec == nil {
-			return resp, nil
+	currentModel := req.Model
+
+	for depth := 0; depth <= maxDepth; depth++ {
+		execReq := req
+		execReq.Model = currentModel
+
+		if depth > 0 {
+			fbMetadata := FallbackMetadata{
+				OriginalModel:   originalModel,
+				FallbackHistory: fallbackHistory,
+			}
+			fbJSON, _ := json.Marshal(fbMetadata)
+			execReq.Metadata = req.Metadata
+			if execReq.Metadata == nil {
+				execReq.Metadata = make(map[string]interface{})
+			}
+			execReq.Metadata["fallback_metadata"] = string(fbJSON)
 		}
-		lastErr = errExec
-		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, attempts, rotated, req.Model, maxWait)
-		if !shouldRetry {
-			break
+
+		normalized := m.normalizeProviders(providers)
+		if len(normalized) == 0 {
+			return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 		}
-		if errWait := waitForCooldown(ctx, wait); errWait != nil {
-			return cliproxyexecutor.Response{}, errWait
+		rotated := m.rotateProviders(currentModel, normalized)
+
+		retryTimes, maxWait := m.retrySettings()
+		attempts := retryTimes + 1
+		if attempts < 1 {
+			attempts = 1
 		}
+
+		for attempt := 0; attempt < attempts; attempt++ {
+			resp, errExec := m.executeProvidersOnce(ctx, rotated, func(execCtx context.Context, provider string) (cliproxyexecutor.Response, error) {
+				return m.executeWithProvider(execCtx, provider, execReq, opts)
+			})
+			if errExec == nil {
+				return resp, nil
+			}
+			lastErr = errExec
+
+			if depth < maxDepth && m.ShouldChainFallback(errExec) {
+				nextModel := m.GetFallbackForModel(currentModel)
+				if nextModel != "" && nextModel != currentModel {
+					used := false
+					for _, h := range fallbackHistory {
+						if strings.EqualFold(h, nextModel) {
+							used = true
+							break
+						}
+					}
+					if !used {
+						fallbackHistory = append(fallbackHistory, currentModel)
+						currentModel = nextModel
+						break
+					}
+				}
+			}
+
+			wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, attempts, rotated, currentModel, maxWait)
+			if !shouldRetry {
+				break
+			}
+			if errWait := waitForCooldown(ctx, wait); errWait != nil {
+				return cliproxyexecutor.Response{}, errWait
+			}
+		}
+
+		if depth < maxDepth && len(fallbackHistory) > depth && m.ShouldChainFallback(lastErr) {
+			continue
+		}
+
+		break
 	}
+
 	if lastErr != nil {
 		return cliproxyexecutor.Response{}, lastErr
 	}
@@ -298,36 +427,88 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 
 // ExecuteCount performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
+// When a model fails due to quota exhaustion (HTTP 429), it automatically falls back
+// to the next model in the configured fallback chain.
 func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	normalized := m.normalizeProviders(providers)
-	if len(normalized) == 0 {
-		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
-	}
-	rotated := m.rotateProviders(req.Model, normalized)
-
-	retryTimes, maxWait := m.retrySettings()
-	attempts := retryTimes + 1
-	if attempts < 1 {
-		attempts = 1
-	}
+	originalModel := req.Model
+	fallbackHistory := []string{}
+	maxDepth := m.getModelFallbackDepth()
 
 	var lastErr error
-	for attempt := 0; attempt < attempts; attempt++ {
-		resp, errExec := m.executeProvidersOnce(ctx, rotated, func(execCtx context.Context, provider string) (cliproxyexecutor.Response, error) {
-			return m.executeCountWithProvider(execCtx, provider, req, opts)
-		})
-		if errExec == nil {
-			return resp, nil
+	currentModel := req.Model
+
+	for depth := 0; depth <= maxDepth; depth++ {
+		execReq := req
+		execReq.Model = currentModel
+
+		if depth > 0 {
+			fbMetadata := FallbackMetadata{
+				OriginalModel:   originalModel,
+				FallbackHistory: fallbackHistory,
+			}
+			fbJSON, _ := json.Marshal(fbMetadata)
+			execReq.Metadata = req.Metadata
+			if execReq.Metadata == nil {
+				execReq.Metadata = make(map[string]interface{})
+			}
+			execReq.Metadata["fallback_metadata"] = string(fbJSON)
 		}
-		lastErr = errExec
-		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, attempts, rotated, req.Model, maxWait)
-		if !shouldRetry {
-			break
+
+		normalized := m.normalizeProviders(providers)
+		if len(normalized) == 0 {
+			return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 		}
-		if errWait := waitForCooldown(ctx, wait); errWait != nil {
-			return cliproxyexecutor.Response{}, errWait
+		rotated := m.rotateProviders(currentModel, normalized)
+
+		retryTimes, maxWait := m.retrySettings()
+		attempts := retryTimes + 1
+		if attempts < 1 {
+			attempts = 1
 		}
+
+		for attempt := 0; attempt < attempts; attempt++ {
+			resp, errExec := m.executeProvidersOnce(ctx, rotated, func(execCtx context.Context, provider string) (cliproxyexecutor.Response, error) {
+				return m.executeCountWithProvider(execCtx, provider, execReq, opts)
+			})
+			if errExec == nil {
+				return resp, nil
+			}
+			lastErr = errExec
+
+			if depth < maxDepth && m.ShouldChainFallback(errExec) {
+				nextModel := m.GetFallbackForModel(currentModel)
+				if nextModel != "" && nextModel != currentModel {
+					used := false
+					for _, h := range fallbackHistory {
+						if strings.EqualFold(h, nextModel) {
+							used = true
+							break
+						}
+					}
+					if !used {
+						fallbackHistory = append(fallbackHistory, currentModel)
+						currentModel = nextModel
+						break
+					}
+				}
+			}
+
+			wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, attempts, rotated, currentModel, maxWait)
+			if !shouldRetry {
+				break
+			}
+			if errWait := waitForCooldown(ctx, wait); errWait != nil {
+				return cliproxyexecutor.Response{}, errWait
+			}
+		}
+
+		if depth < maxDepth && len(fallbackHistory) > depth && m.ShouldChainFallback(lastErr) {
+			continue
+		}
+
+		break
 	}
+
 	if lastErr != nil {
 		return cliproxyexecutor.Response{}, lastErr
 	}
@@ -336,36 +517,88 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 
 // ExecuteStream performs a streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
+// When a model fails due to quota exhaustion (HTTP 429), it automatically falls back
+// to the next model in the configured fallback chain.
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (<-chan cliproxyexecutor.StreamChunk, error) {
-	normalized := m.normalizeProviders(providers)
-	if len(normalized) == 0 {
-		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
-	}
-	rotated := m.rotateProviders(req.Model, normalized)
-
-	retryTimes, maxWait := m.retrySettings()
-	attempts := retryTimes + 1
-	if attempts < 1 {
-		attempts = 1
-	}
+	originalModel := req.Model
+	fallbackHistory := []string{}
+	maxDepth := m.getModelFallbackDepth()
 
 	var lastErr error
-	for attempt := 0; attempt < attempts; attempt++ {
-		chunks, errStream := m.executeStreamProvidersOnce(ctx, rotated, func(execCtx context.Context, provider string) (<-chan cliproxyexecutor.StreamChunk, error) {
-			return m.executeStreamWithProvider(execCtx, provider, req, opts)
-		})
-		if errStream == nil {
-			return chunks, nil
+	currentModel := req.Model
+
+	for depth := 0; depth <= maxDepth; depth++ {
+		execReq := req
+		execReq.Model = currentModel
+
+		if depth > 0 {
+			fbMetadata := FallbackMetadata{
+				OriginalModel:   originalModel,
+				FallbackHistory: fallbackHistory,
+			}
+			fbJSON, _ := json.Marshal(fbMetadata)
+			execReq.Metadata = req.Metadata
+			if execReq.Metadata == nil {
+				execReq.Metadata = make(map[string]interface{})
+			}
+			execReq.Metadata["fallback_metadata"] = string(fbJSON)
 		}
-		lastErr = errStream
-		wait, shouldRetry := m.shouldRetryAfterError(errStream, attempt, attempts, rotated, req.Model, maxWait)
-		if !shouldRetry {
-			break
+
+		normalized := m.normalizeProviders(providers)
+		if len(normalized) == 0 {
+			return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 		}
-		if errWait := waitForCooldown(ctx, wait); errWait != nil {
-			return nil, errWait
+		rotated := m.rotateProviders(currentModel, normalized)
+
+		retryTimes, maxWait := m.retrySettings()
+		attempts := retryTimes + 1
+		if attempts < 1 {
+			attempts = 1
 		}
+
+		for attempt := 0; attempt < attempts; attempt++ {
+			chunks, errStream := m.executeStreamProvidersOnce(ctx, rotated, func(execCtx context.Context, provider string) (<-chan cliproxyexecutor.StreamChunk, error) {
+				return m.executeStreamWithProvider(execCtx, provider, execReq, opts)
+			})
+			if errStream == nil {
+				return chunks, nil
+			}
+			lastErr = errStream
+
+			if depth < maxDepth && m.ShouldChainFallback(errStream) {
+				nextModel := m.GetFallbackForModel(currentModel)
+				if nextModel != "" && nextModel != currentModel {
+					used := false
+					for _, h := range fallbackHistory {
+						if strings.EqualFold(h, nextModel) {
+							used = true
+							break
+						}
+					}
+					if !used {
+						fallbackHistory = append(fallbackHistory, currentModel)
+						currentModel = nextModel
+						break
+					}
+				}
+			}
+
+			wait, shouldRetry := m.shouldRetryAfterError(errStream, attempt, attempts, rotated, currentModel, maxWait)
+			if !shouldRetry {
+				break
+			}
+			if errWait := waitForCooldown(ctx, wait); errWait != nil {
+				return nil, errWait
+			}
+		}
+
+		if depth < maxDepth && len(fallbackHistory) > depth && m.ShouldChainFallback(lastErr) {
+			continue
+		}
+
+		break
 	}
+
 	if lastErr != nil {
 		return nil, lastErr
 	}
@@ -1236,7 +1469,6 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 			return nil
 		}
 	}
-	// Skip persistence when metadata is absent (e.g., runtime-only auths).
 	if auth.Metadata == nil {
 		return nil
 	}
@@ -1283,7 +1515,6 @@ func (m *Manager) StopAutoRefresh() {
 }
 
 func (m *Manager) checkRefreshes(ctx context.Context) {
-	// log.Debugf("checking refreshes")
 	now := time.Now()
 	snapshot := m.snapshotAuths()
 	for _, a := range snapshot {
@@ -1570,8 +1801,6 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	if updated == nil {
 		updated = cloned
 	}
-	// Preserve runtime created by the executor during Refresh.
-	// If executor didn't set one, fall back to the previous runtime.
 	if updated.Runtime == nil {
 		updated.Runtime = auth.Runtime
 	}

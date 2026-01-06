@@ -17,6 +17,7 @@ type TLSConfig = internalconfig.TLSConfig
 type RemoteManagement = internalconfig.RemoteManagement
 type AmpCode = internalconfig.AmpCode
 type ModelNameMapping = internalconfig.ModelNameMapping
+type ModelFallback = internalconfig.ModelFallback
 type PayloadConfig = internalconfig.PayloadConfig
 type PayloadRule = internalconfig.PayloadRule
 type PayloadModelRule = internalconfig.PayloadModelRule
@@ -36,6 +37,7 @@ const (
 	AccessProviderTypeConfigAPIKey = internalconfig.AccessProviderTypeConfigAPIKey
 	DefaultAccessProviderName      = internalconfig.DefaultAccessProviderName
 	DefaultPanelGitHubRepository   = internalconfig.DefaultPanelGitHubRepository
+	DefaultModelFallbackDepth      = 3
 )
 
 func MakeInlineAPIKeyProvider(keys []string) *AccessProvider {
